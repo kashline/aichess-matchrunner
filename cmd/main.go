@@ -64,7 +64,7 @@ func main() {
 		redisUrl = "host.docker.internal:6379"
 	}
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "host.docker.internal:6379",
+		Addr: redisUrl,
 	})
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {

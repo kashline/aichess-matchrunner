@@ -18,4 +18,4 @@ docker build -t $IMAGE_NAME .
 
 # Run the container with the environment variable
 echo "Running Docker container..."
-docker run --cpus=2 --rm -e DATABASE_URL -e STOCKFISH_URL -e OPENAI_API_KEY $IMAGE_NAME
+docker run --cpus=2 --rm -e DATABASE_URL -e STOCKFISH_URL -e OPENAI_API_KEY -e REDIS_URL $IMAGE_NAME

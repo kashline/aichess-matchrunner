@@ -59,6 +59,10 @@ type BotResponse struct {
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	redisUrl := os.Getenv("REDIS_URL")
+	if redisUrl == "" {
+		redisUrl = "host.docker.internal:6379"
+	}
 	rdb := redis.NewClient(&redis.Options{
 		Addr: "host.docker.internal:6379",
 	})

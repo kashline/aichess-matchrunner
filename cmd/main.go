@@ -29,7 +29,6 @@ import (
 	"github.com/invopop/jsonschema"
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
-	_ "go.uber.org/automaxprocs/maxprocs"
 )
 
 type Match struct {
@@ -113,7 +112,6 @@ mainLoop:
 			log.Printf("Slot acquired, executing... Current processes: %v", len(sem))
 			go func(matchData string) {
 				defer func() { <-sem }()
-				time.Sleep(20 * time.Second)
 				var match Match
 				if err := json.Unmarshal([]byte(matchData), &match); err != nil {
 					log.Printf("failed to decode game: %v", err)

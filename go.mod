@@ -35,7 +35,6 @@ require (
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/openai/openai-go v1.1.0
-	go.uber.org/automaxprocs v1.6.0
 	golang.org/x/text v0.24.0 // indirect
 	gorm.io/datatypes v1.2.5
 	gorm.io/driver/postgres v1.5.11

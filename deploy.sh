@@ -11,11 +11,12 @@ fi
 
 # Define the image name
 IMAGE_NAME="aichess-matchrunner"
+PROJECT="aichess-457721"
 
 # Build the Docker image
 echo "Building Docker image..."
 docker build -t $IMAGE_NAME .
 
-# Run the container with the environment variable
-echo "Running Docker container..."
-docker run -p 8080:8080 --cpus=2 -d -e DATABASE_URL -e STOCKFISH_URL -e OPENAI_API_KEY -e REDIS_URL $IMAGE_NAME
+docker tag aichess-matchrunner:latest us-west1-docker.pkg.dev/$PROJECT/$IMAGE_NAME/$IMAGE_NAME:latest
+
+docker push us-west1-docker.pkg.dev/$PROJECT/$IMAGE_NAME/$IMAGE_NAME:latest

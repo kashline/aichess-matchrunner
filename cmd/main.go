@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os/signal"
-	"runtime"
-	"sync"
 	"syscall"
 
 	"log"
@@ -18,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -59,6 +56,26 @@ type BotResponse struct {
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go startWorker(ctx, cancel)
+	// Set up the HTTP health endpoint
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if healthz() {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, "healthy")
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintln(w, "unhealthy")
+		}
+	})
+	port := "8080"
+	log.Printf("Starting HTTP server on port %s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
+}
+
+func startWorker(ctx context.Context, cancel context.CancelFunc) {
+	defer cancel()
 	redisUrl := os.Getenv("REDIS_URL")
 	if redisUrl == "" {
 		redisUrl = "host.docker.internal:6379"
@@ -77,123 +94,147 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	// Concurrency semaphore
-	maxThreads := runtime.NumCPU()
+	// maxThreads := runtime.NumCPU()
+	maxThreads := 2
 	sem := make(chan struct{}, maxThreads)
-	var activeMatches sync.Map
-	go func() {
-		<-sigChan
-		log.Println("Signal received, shutting down...")
-		cancel()
-	}()
-mainLoop:
+	// var activeMatches sync.Map
+	// mainLoop:
 	for {
-		var lastMatch *Match
-		select {
+		// var lastMatch *Match
+		// select {
 		// Shutdown cleanup
-		case <-ctx.Done():
-			log.Println("Cleanup during shutdown...")
-			log.Println("Shutting down active matches...")
-			activeMatches.Range(func(_, value any) bool {
-				match := value.(Match)
-				log.Printf("Cleaning up match FEN: %s\n", match.FEN)
-				createRedisMatch(match, rdb)
-				return true
-			})
-			break mainLoop
-		default:
-			// Get a game from the queue
-			log.Println("Fetching a game")
-			result, err := rdb.BRPop(ctx, 5*time.Second, "matchmaking_queue").Result()
-			if err != nil {
-				fmt.Println("Error while reading from queue:", err)
-				if err.Error() == "redis: nil" && !(lastMatch == nil) {
-					lastMatch = nil
-				}
-				time.Sleep(10 * time.Second)
-				continue
+		// case <-ctx.Done():
+		// 	log.Println("Cleanup during shutdown...")
+		// 	log.Println("Shutting down active matches...")
+		// 	activeMatches.Range(func(_, value any) bool {
+		// 		match := value.(Match)
+		// 		log.Printf("Cleaning up match FEN: %s\n", match.FEN)
+		// 		createRedisMatch(match, rdb)
+		// 		return true
+		// 	})
+		// 	break mainLoop
+		// default:
+		// Get a game from the queue
+		log.Println("Fetching a game")
+		result, err := rdb.BRPop(ctx, 5*time.Second, "matchmaking_queue").Result()
+		if err != nil {
+			log.Print("Error while reading from queue:", err)
+			if err.Error() == "redis: nil" {
+				// if !(lastMatch == nil) {
+				// 	lastMatch = nil
+				// }
+				log.Print("No matches found. Exiting..")
+				os.Exit(0)
 			}
-			sem <- struct{}{}
-			log.Printf("Slot acquired, executing... Current processes: %v", len(sem))
-			go func(matchData string) {
-				defer func() { <-sem }()
-				var match Match
-				if err := json.Unmarshal([]byte(matchData), &match); err != nil {
-					log.Printf("failed to decode game: %v", err)
-				}
-				matchID := uuid.New().String()
-				activeMatches.Store(matchID, match)
-
-				defer func() {
-					<-sem
-					activeMatches.Delete(matchID)
-				}()
-				validMoves, err := generateValidMoves(match.FEN)
-				if err != nil {
-					log.Printf("failed to generate moves %v", err)
-				}
-				if len(validMoves) == 0 {
-					log.Print("No valid moves! Game must be over...")
-					time.Sleep(60 * time.Second)
-				}
-				// Generate move
-				log.Println("Generating move")
-				turn, err := getTurnFromFEN(match.FEN)
-				if err != nil {
-					log.Printf("failed getting turnfromfen")
-				}
-				var model openai.ChatModel
-				var prompt string
-				if turn == "white" {
-					model = openai.ChatModel(match.FirstBot.Model)
-					prompt = match.FirstBot.Prompt
-				} else {
-					model = openai.ChatModel(match.SecondBot.Model)
-					prompt = match.SecondBot.Prompt
-				}
-				move, err := generateMove(model, match.FEN, validMoves, prompt)
-				if err != nil {
-					log.Printf("error generating move %v", err)
-				}
-				// LLM responded with invalid index
-				if move == "" {
-					log.Print("Invalid move, retrying")
-					onShutdown(*lastMatch, rdb)
-					return
-				}
-				// Make move
-				newFen, score, err := makeMove(match.FEN, move)
-				if err != nil {
-					log.Printf("failed to make move %v", err)
-				}
-				history := History{
-					Move:  move,
-					Score: score,
-				}
-				match.FEN = newFen
-				match.History = append(match.History, history)
-				match.RemainingTurns--
-				// Determine if this was the last turn.
-				// If so, write the result to the database and don't write to redis.
-
-				// This was the last turn
-				if match.RemainingTurns <= 0 {
-					log.Println("game over turn limit reached")
-					// TODO write to db
-					err = writeResult(match, db)
-					if err != nil {
-						log.Printf("error writing result! %v", err)
-					}
-					return
-				}
-				// This was not the last turn, so write to redis
-				err = createRedisMatch(match, rdb)
-				if err != nil {
-					log.Printf("failed to update redis match %v", err)
-				}
-				log.Printf("redis updated. turns remaining: %v", match.RemainingTurns)
-			}(result[1])
+			time.Sleep(10 * time.Second)
+			continue
 		}
+		sem <- struct{}{}
+		log.Printf("Slot acquired, executing... Current processes: %v", len(sem))
+		go func(matchData string) {
+			defer func() { <-sem }()
+			var match Match
+			if err := json.Unmarshal([]byte(matchData), &match); err != nil {
+				log.Printf("failed to decode game: %v", err)
+			}
+			// matchID := uuid.New().String()
+			// activeMatches.Store(matchID, match)
+
+			// defer func() {
+			// 	<-sem
+			// 	activeMatches.Delete(matchID)
+			// }()
+			validMoves, err := generateValidMoves(match.FEN)
+			if err != nil {
+				log.Printf("failed to generate moves %v", err)
+			}
+			if len(validMoves) == 0 {
+				log.Print("No valid moves! Game must be over...")
+				time.Sleep(60 * time.Second)
+			}
+			// Generate move
+			log.Println("Generating move")
+			turn, err := getTurnFromFEN(match.FEN)
+			if err != nil {
+				log.Printf("failed getting turnfromfen")
+			}
+			var model openai.ChatModel
+			var prompt string
+			if turn == "white" {
+				model = openai.ChatModel(match.FirstBot.Model)
+				prompt = match.FirstBot.Prompt
+			} else {
+				model = openai.ChatModel(match.SecondBot.Model)
+				prompt = match.SecondBot.Prompt
+			}
+			move, err := generateMove(model, match.FEN, validMoves, prompt)
+			if err != nil {
+				log.Printf("error generating move %v", err)
+			}
+			// LLM responded with invalid index
+			if move == "" {
+				log.Print("Invalid move, retrying")
+				createRedisMatch(match, rdb)
+				// onShutdown(*lastMatch, rdb)
+				return
+			}
+			// Make move
+			newFen, score, err := makeMove(match.FEN, move)
+			if err != nil {
+				log.Printf("failed to make move %v", err)
+			}
+			history := History{
+				Move:  move,
+				Score: score,
+			}
+			match.FEN = newFen
+			match.History = append(match.History, history)
+			match.RemainingTurns--
+			// Determine if this was the last turn.
+			// If so, write the result to the database and don't write to redis.
+
+			// This was the last turn
+			if match.RemainingTurns <= 0 {
+				log.Println("game over turn limit reached")
+				// TODO write to db
+				err = writeResult(match, db)
+				if err != nil {
+					log.Printf("error writing result! %v", err)
+				}
+				return
+			}
+			// This was not the last turn, so write to redis
+			err = createRedisMatch(match, rdb)
+			if err != nil {
+				log.Printf("failed to update redis match %v", err)
+			}
+			log.Printf("redis updated. turns remaining: %v", match.RemainingTurns)
+		}(result[1])
 	}
+}
+
+func healthz() bool {
+	redisUrl := os.Getenv("REDIS_URL")
+	if redisUrl == "" {
+		redisUrl = "host.docker.internal:6379"
+	}
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisUrl,
+	})
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "host=host.docker.internal user=postgres password=postgres dbname=yourdb port=5432 sslmode=disable"
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Printf("failed to connect to db %v", err)
+		return false
+	}
+	if rdb == nil || db == nil || err != nil {
+		log.Printf("Something went wrong checking downstream dependencies. rdb: %v, db: %v, err: %v", rdb, db, err)
+		return false
+	}
+	return true
 }
 
 func onShutdown(match Match, rdb *redis.Client) {
@@ -337,7 +378,7 @@ func makeMove(fen string, move string) (string, int, error) {
 	var scoreParsed Score
 	err = json.Unmarshal([]byte(score), &scoreParsed)
 	if err != nil {
-		log.Println("failed to convert score to int")
+		log.Printf("failed to convert score to int: %v", err)
 		return newFenParsed.FEN, -1, nil
 	}
 	return newFenParsed.FEN, scoreParsed.ScoreDifference, nil

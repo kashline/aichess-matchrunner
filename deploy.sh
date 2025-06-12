@@ -15,7 +15,7 @@ PROJECT="aichess-457721"
 
 # Build the Docker image
 echo "Building Docker image..."
-docker build -t $IMAGE_NAME .
+docker buildx build --platform linux/amd64 -t $IMAGE_NAME .
 
 docker tag aichess-matchrunner:latest us-west1-docker.pkg.dev/$PROJECT/$IMAGE_NAME/$IMAGE_NAME:latest
 

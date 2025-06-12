@@ -76,13 +76,12 @@ func main() {
 
 func startWorker(ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
-	redisUrl := os.Getenv("REDIS_URL")
-	if redisUrl == "" {
-		redisUrl = "host.docker.internal:6379"
+	redisUrl, err := redis.ParseURL(os.Getenv("REDIS_URL"))
+	if err != nil {
+		log.Printf("failed to parse REDIS_URL environment variable: %v", err)
+		redisUrl.Addr = "host.docker.internal:6379"
 	}
-	rdb := redis.NewClient(&redis.Options{
-		Addr: redisUrl,
-	})
+	rdb := redis.NewClient(redisUrl)
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "host=host.docker.internal user=postgres password=postgres dbname=yourdb port=5432 sslmode=disable"
@@ -237,19 +236,19 @@ func healthz() bool {
 	return true
 }
 
-func onShutdown(match Match, rdb *redis.Client) {
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigs
-		log.Println("\nReceived signal:", sig)
-		log.Println("Shutting down gracefully...")
-		createRedisMatch(match, rdb)
-		log.Printf("Reset in flight match: %v", match)
-		log.Println("Exiting")
-		os.Exit(0)
-	}()
-}
+// func onShutdown(match Match, rdb *redis.Client) {
+// 	sigs := make(chan os.Signal, 1)
+// 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+// 	go func() {
+// 		sig := <-sigs
+// 		log.Println("\nReceived signal:", sig)
+// 		log.Println("Shutting down gracefully...")
+// 		createRedisMatch(match, rdb)
+// 		log.Printf("Reset in flight match: %v", match)
+// 		log.Println("Exiting")
+// 		os.Exit(0)
+// 	}()
+// }
 
 func generateMove(model openai.ChatModel, fen string, moves []string, prompt string) (string, error) {
 	type MoveResponse struct {

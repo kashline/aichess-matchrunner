@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os/signal"
-	"syscall"
+	"runtime"
+
+	// "os/signal"
+	// "runtime"
+	"sync"
+	// "syscall"
 
 	"log"
 	"net/http"
@@ -20,6 +24,7 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
+	"aichess-matchrunner/internal/lib/util"
 	"aichess-matchrunner/internal/models/bot"
 	"aichess-matchrunner/internal/models/botmatchresult"
 
@@ -35,6 +40,8 @@ type Match struct {
 	FEN            string    `json:"fen"`
 	RemainingTurns int       `json:"remainingTurns"`
 	PuzzleID       int       `json:"puzzleId"`
+	BatchFile      string    `json:"batchFile"`
+	ID             string    `json:"id"`
 }
 
 type History struct {
@@ -76,11 +83,8 @@ func main() {
 
 func startWorker(ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
-	redisUrl, err := redis.ParseURL(os.Getenv("REDIS_URL"))
-	if err != nil {
-		log.Printf("failed to parse REDIS_URL environment variable: %v", err)
-		redisUrl.Addr = "host.docker.internal:6379"
-	}
+	// Setup DB connections
+	redisUrl := getRedisOptions()
 	rdb := redis.NewClient(redisUrl)
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
@@ -90,72 +94,80 @@ func startWorker(ctx context.Context, cancel context.CancelFunc) {
 	if err != nil {
 		log.Printf("failed to connect to db %v", err)
 	}
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	// Concurrency semaphore
-	// maxThreads := runtime.NumCPU()
-	maxThreads := 2
+	// sigChan := make(chan os.Signal, 1)
+	// signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	// Concurrency stuff
+	var maxThreads int
+	if os.Getenv("IS_PROD") == "true" {
+		maxThreads = runtime.NumCPU()
+	} else {
+		maxThreads = 1
+	}
 	sem := make(chan struct{}, maxThreads)
-	// var activeMatches sync.Map
-	// mainLoop:
+	fileLength := 0
+	var wg sync.WaitGroup
+	log.Printf("Starting processing. Number of threads: %v", maxThreads)
 	for {
-		// var lastMatch *Match
-		// select {
-		// Shutdown cleanup
-		// case <-ctx.Done():
-		// 	log.Println("Cleanup during shutdown...")
-		// 	log.Println("Shutting down active matches...")
-		// 	activeMatches.Range(func(_, value any) bool {
-		// 		match := value.(Match)
-		// 		log.Printf("Cleaning up match FEN: %s\n", match.FEN)
-		// 		createRedisMatch(match, rdb)
-		// 		return true
-		// 	})
-		// 	break mainLoop
-		// default:
 		// Get a game from the queue
 		log.Println("Fetching a game")
-		result, err := rdb.BRPop(ctx, 5*time.Second, "matchmaking_queue").Result()
+		queueName := "matchmaking_queue"
+		result, err := rdb.BRPop(ctx, 5*time.Second, fmt.Sprintf("%v:pending", queueName)).Result()
 		if err != nil {
 			log.Print("Error while reading from queue:", err)
+			// Nothing in queue
 			if err.Error() == "redis: nil" {
-				// if !(lastMatch == nil) {
-				// 	lastMatch = nil
-				// }
-				log.Print("No matches found. Exiting..")
-				os.Exit(0)
+				log.Print("No matches found. ")
+				_, err := os.Stat("data.jsonl")
+				if err == nil {
+					log.Print("Sending batches.")
+					util.SendBatchRequest()
+				}
+				if os.IsNotExist(err) {
+					log.Print("All jobs are complete! Exiting..")
+					break
+				}
+				break
 			}
+			// Other redis read error, retry
 			time.Sleep(10 * time.Second)
 			continue
 		}
+		var match Match
+		if err := json.Unmarshal([]byte(string(result[1])), &match); err != nil {
+			log.Printf("failed to decode game: %v", err)
+		}
+		log.Print("Setting match....")
+		err = rdb.HSet(ctx, fmt.Sprintf("match:%v", match.ID), "match", string(result[1])).Err()
+		if err != nil {
+			log.Printf("there was an error setting match hash: %v", err)
+		}
 		sem <- struct{}{}
-		log.Printf("Slot acquired, executing... Current processes: %v", len(sem))
+		wg.Add(1)
+		fileLength++
 		go func(matchData string) {
+			defer wg.Done()
 			defer func() { <-sem }()
 			var match Match
 			if err := json.Unmarshal([]byte(matchData), &match); err != nil {
 				log.Printf("failed to decode game: %v", err)
 			}
-			// matchID := uuid.New().String()
-			// activeMatches.Store(matchID, match)
 
-			// defer func() {
-			// 	<-sem
-			// 	activeMatches.Delete(matchID)
-			// }()
+			// Generate list of valid moves
 			validMoves, err := generateValidMoves(match.FEN)
 			if err != nil {
-				log.Printf("failed to generate moves %v", err)
+				log.Printf("failed to generate list of valid moves moves %v", err)
+				return
 			}
 			if len(validMoves) == 0 {
 				log.Print("No valid moves! Game must be over...")
-				time.Sleep(60 * time.Second)
+				return
 			}
 			// Generate move
 			log.Println("Generating move")
 			turn, err := getTurnFromFEN(match.FEN)
 			if err != nil {
 				log.Printf("failed getting turnfromfen")
+				return
 			}
 			var model openai.ChatModel
 			var prompt string
@@ -166,21 +178,27 @@ func startWorker(ctx context.Context, cancel context.CancelFunc) {
 				model = openai.ChatModel(match.SecondBot.Model)
 				prompt = match.SecondBot.Prompt
 			}
-			move, err := generateMove(model, match.FEN, validMoves, prompt)
+
+			move, err := util.GenerateBatchMove(model, match.FEN, validMoves, prompt, &fileLength)
 			if err != nil {
-				log.Printf("error generating move %v", err)
+				log.Printf("error generating batch move: %v", err)
+				return
 			}
+
+			// move, err := generateMove(model, match.FEN, validMoves, prompt)
+			// if err != nil {
+			// 	log.Printf("error generating move %v", err)
+			// }
 			// LLM responded with invalid index
 			if move == "" {
 				log.Print("Invalid move, retrying")
-				createRedisMatch(match, rdb)
-				// onShutdown(*lastMatch, rdb)
 				return
 			}
 			// Make move
 			newFen, score, err := makeMove(match.FEN, move)
 			if err != nil {
 				log.Printf("failed to make move %v", err)
+				return
 			}
 			history := History{
 				Move:  move,
@@ -194,7 +212,7 @@ func startWorker(ctx context.Context, cancel context.CancelFunc) {
 
 			// This was the last turn
 			if match.RemainingTurns <= 0 {
-				log.Println("game over turn limit reached")
+				log.Println("game over! turn limit reached")
 				// TODO write to db
 				err = writeResult(match, db)
 				if err != nil {
@@ -203,13 +221,16 @@ func startWorker(ctx context.Context, cancel context.CancelFunc) {
 				return
 			}
 			// This was not the last turn, so write to redis
-			err = createRedisMatch(match, rdb)
+			// err = createRedisMatch(match, rdb)
 			if err != nil {
 				log.Printf("failed to update redis match %v", err)
 			}
 			log.Printf("redis updated. turns remaining: %v", match.RemainingTurns)
-		}(result[1])
+		}(string(result[1]))
 	}
+	wg.Wait()
+	log.Print("All tasks complete.  Exiting")
+	// os.Exit(0)
 }
 
 func healthz() bool {
@@ -234,6 +255,24 @@ func healthz() bool {
 		return false
 	}
 	return true
+}
+
+func getRedisOptions() *redis.Options {
+	url := os.Getenv("REDIS_URL")
+	if url != "" {
+		opt, err := redis.ParseURL(url)
+		if err == nil {
+			return opt
+		}
+		log.Printf("failed to parse REDIS_URL: %v, falling back to host.docker.internal", err)
+	} else {
+		log.Printf("REDIS_URL not set, defaulting to host.docker.internal")
+	}
+
+	// fallback to unauthenticated localhost
+	return &redis.Options{
+		Addr: "host.docker.internal:6379", // or "host.docker.internal:6379" for Docker-to-host access
+	}
 }
 
 // func onShutdown(match Match, rdb *redis.Client) {
@@ -388,6 +427,15 @@ func sendStockfishRequest(stem string, payload []byte, method string) (string, e
 	if url == "" {
 		url = "http://host.docker.internal:5001" + stem
 	}
+	// Use gcp auth in prod
+	if os.Getenv("IS_PROD") == "true" {
+		data, err := SendAuthenticatedRequest(method, url, payload, map[string]string{"Content-Type": "application/json"})
+		if err != nil {
+			log.Printf("failed to send authenticated request to stockfish: %v", err)
+		}
+		return string(data), err
+	}
+	// Not prod so no auth
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(payload))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -413,7 +461,7 @@ func createRedisMatch(match Match, rdb *redis.Client) error {
 	if err != nil {
 		return err
 	}
-	err = rdb.LPush(ctx, "matchmaking_queue", matchJSON).Err()
+	err = rdb.LPush(ctx, "matchmaking_queue:pending", matchJSON).Err()
 	if err != nil {
 		return err
 	}
@@ -449,4 +497,61 @@ func determineScore(history []History) int {
 		}
 	}
 	return acc
+}
+
+// SendAuthenticatedRequest sends a request with a GCP ID token (retrieved from the metadata server).
+// It works when running inside GCP (e.g., Cloud Run, GCE, GKE).
+func SendAuthenticatedRequest(
+	method string,
+	url string,
+	body []byte,
+	headers map[string]string, // optional additional headers
+) ([]byte, error) {
+	// Step 1: Get ID token for target URL (audience must match the service)
+	tokenURL := "http://metadata/computeMetadata/v1/instance/service-accounts/default/identity?audience=" + url
+	tokenReq, _ := http.NewRequest("GET", tokenURL, nil)
+	tokenReq.Header.Add("Metadata-Flavor", "Google")
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	tokenResp, err := httpClient.Do(tokenReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch ID token: %w", err)
+	}
+	defer tokenResp.Body.Close()
+
+	idTokenBytes, err := io.ReadAll(tokenResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read ID token: %w", err)
+	}
+	idToken := string(idTokenBytes)
+
+	// Step 2: Make the authenticated request
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+idToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Optional extra headers
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("authenticated request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return respBody, nil
 }

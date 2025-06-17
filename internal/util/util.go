@@ -59,12 +59,7 @@ func StartWorker(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGr
 	defer cancel()
 	defer wg.Done()
 	// Setup db connections
-	redisUrl, err := redis.ParseURL(os.Getenv("REDIS_URL"))
-	if err != nil {
-		log.Printf("failed to parse REDIS_URL environment variable: %v", err)
-		redisUrl.Addr = "host.docker.internal:6379"
-	}
-	rdb := redis.NewClient(redisUrl)
+	rdb := redis.NewClient(GetRedisOptions())
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "host=host.docker.internal user=postgres password=postgres dbname=yourdb port=5432 sslmode=disable"

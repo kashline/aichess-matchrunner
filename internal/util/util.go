@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"log"
@@ -54,8 +55,9 @@ type BotResponse struct {
 }
 
 // StartWorker starts the worker loop. Matches are read from a queue and processed, either writing back to redis or the database.  Spawns go routines for each found match.
-func StartWorker(ctx context.Context, cancel context.CancelFunc) {
+func StartWorker(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup) {
 	defer cancel()
+	defer wg.Done()
 	// Setup db connections
 	redisUrl, err := redis.ParseURL(os.Getenv("REDIS_URL"))
 	if err != nil {
@@ -94,9 +96,11 @@ func StartWorker(ctx context.Context, cancel context.CancelFunc) {
 		}
 		// Update semaphore
 		sem <- struct{}{}
+		wg.Add(1)
 		go func(matchData string) {
 			// Concurrency
 			defer func() { <-sem }()
+			defer wg.Done()
 
 			// Create match object
 			var match Match

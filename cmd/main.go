@@ -56,7 +56,7 @@ type BotResponse struct {
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go startWorker(ctx, cancel)
+	go StartWorker(ctx, cancel)
 	// Set up the HTTP health endpoint
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if healthz() {
@@ -74,8 +74,10 @@ func main() {
 	}
 }
 
-func startWorker(ctx context.Context, cancel context.CancelFunc) {
+// StartWorker starts the worker loop. Matches are read from a queue and processed, either writing back to redis or the database.  Spawns go routines for each found match.
+func StartWorker(ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
+	// Setup db connections
 	redisUrl, err := redis.ParseURL(os.Getenv("REDIS_URL"))
 	if err != nil {
 		log.Printf("failed to parse REDIS_URL environment variable: %v", err)
@@ -90,60 +92,41 @@ func startWorker(ctx context.Context, cancel context.CancelFunc) {
 	if err != nil {
 		log.Printf("failed to connect to db %v", err)
 	}
+
+	// Concurrency stuff
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	// Concurrency semaphore
-	// maxThreads := runtime.NumCPU()
 	maxThreads := 2
 	sem := make(chan struct{}, maxThreads)
-	// var activeMatches sync.Map
-	// mainLoop:
+
+	// Main worker loop
 	for {
-		// var lastMatch *Match
-		// select {
-		// Shutdown cleanup
-		// case <-ctx.Done():
-		// 	log.Println("Cleanup during shutdown...")
-		// 	log.Println("Shutting down active matches...")
-		// 	activeMatches.Range(func(_, value any) bool {
-		// 		match := value.(Match)
-		// 		log.Printf("Cleaning up match FEN: %s\n", match.FEN)
-		// 		createRedisMatch(match, rdb)
-		// 		return true
-		// 	})
-		// 	break mainLoop
-		// default:
 		// Get a game from the queue
 		log.Println("Fetching a game")
 		result, err := rdb.BRPop(ctx, 5*time.Second, "matchmaking_queue").Result()
 		if err != nil {
 			log.Print("Error while reading from queue:", err)
 			if err.Error() == "redis: nil" {
-				// if !(lastMatch == nil) {
-				// 	lastMatch = nil
-				// }
 				log.Print("No matches found. Exiting..")
 				os.Exit(0)
 			}
 			time.Sleep(10 * time.Second)
 			continue
 		}
+		// Update semaphore
 		sem <- struct{}{}
-		log.Printf("Slot acquired, executing... Current processes: %v", len(sem))
 		go func(matchData string) {
+			// Concurrency
 			defer func() { <-sem }()
+
+			// Create match object
 			var match Match
 			if err := json.Unmarshal([]byte(matchData), &match); err != nil {
 				log.Printf("failed to decode game: %v", err)
 			}
-			// matchID := uuid.New().String()
-			// activeMatches.Store(matchID, match)
 
-			// defer func() {
-			// 	<-sem
-			// 	activeMatches.Delete(matchID)
-			// }()
-			validMoves, err := generateValidMoves(match.FEN)
+			// Create list of valid moves from stockfish
+			validMoves, err := GenerateValidMoves(match.FEN)
 			if err != nil {
 				log.Printf("failed to generate moves %v", err)
 			}
@@ -151,12 +134,14 @@ func startWorker(ctx context.Context, cancel context.CancelFunc) {
 				log.Print("No valid moves! Game must be over...")
 				time.Sleep(60 * time.Second)
 			}
-			// Generate move
-			log.Println("Generating move")
-			turn, err := getTurnFromFEN(match.FEN)
+
+			// Get current turn
+			turn, err := GetTurnFromFEN(match.FEN)
 			if err != nil {
 				log.Printf("failed getting turnfromfen")
 			}
+
+			// Set request
 			var model openai.ChatModel
 			var prompt string
 			if turn == "white" {
@@ -166,19 +151,23 @@ func startWorker(ctx context.Context, cancel context.CancelFunc) {
 				model = openai.ChatModel(match.SecondBot.Model)
 				prompt = match.SecondBot.Prompt
 			}
-			move, err := generateMove(model, match.FEN, validMoves, prompt)
+
+			// Generate move
+			log.Println("Generating move")
+			move, err := GenerateMove(model, match.FEN, validMoves, prompt)
 			if err != nil {
 				log.Printf("error generating move %v", err)
 			}
+
 			// LLM responded with invalid index
 			if move == "" {
 				log.Print("Invalid move, retrying")
-				createRedisMatch(match, rdb)
-				// onShutdown(*lastMatch, rdb)
+				CreateRedisMatch(match, rdb)
 				return
 			}
+
 			// Make move
-			newFen, score, err := makeMove(match.FEN, move)
+			newFen, score, err := MakeMove(match.FEN, move)
 			if err != nil {
 				log.Printf("failed to make move %v", err)
 			}
@@ -186,29 +175,48 @@ func startWorker(ctx context.Context, cancel context.CancelFunc) {
 				Move:  move,
 				Score: score,
 			}
+
+			// Update match
 			match.FEN = newFen
 			match.History = append(match.History, history)
 			match.RemainingTurns--
+
 			// Determine if this was the last turn.
 			// If so, write the result to the database and don't write to redis.
 
 			// This was the last turn
 			if match.RemainingTurns <= 0 {
 				log.Println("game over turn limit reached")
-				// TODO write to db
-				err = writeResult(match, db)
+				err = WriteResult(match, db)
 				if err != nil {
 					log.Printf("error writing result! %v", err)
 				}
 				return
 			}
 			// This was not the last turn, so write to redis
-			err = createRedisMatch(match, rdb)
+			err = CreateRedisMatch(match, rdb)
 			if err != nil {
 				log.Printf("failed to update redis match %v", err)
 			}
 			log.Printf("redis updated. turns remaining: %v", match.RemainingTurns)
 		}(result[1])
+	}
+}
+
+// GetRedisOptions sets redis client options based on environment
+func GetRedisOptions() *redis.Options {
+	url := os.Getenv("REDIS_URL")
+	if url != "" {
+		opt, err := redis.ParseURL(url)
+		if err == nil {
+			return opt
+		}
+		log.Printf("failed to parse REDIS_URL: %v, falling back to host.docker.internal", err)
+	} else {
+		log.Printf("REDIS_URL not set, defaulting to host.docker.internal")
+	}
+	return &redis.Options{
+		Addr: "host.docker.internal:6379",
 	}
 }
 
@@ -236,21 +244,8 @@ func healthz() bool {
 	return true
 }
 
-// func onShutdown(match Match, rdb *redis.Client) {
-// 	sigs := make(chan os.Signal, 1)
-// 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-// 	go func() {
-// 		sig := <-sigs
-// 		log.Println("\nReceived signal:", sig)
-// 		log.Println("Shutting down gracefully...")
-// 		createRedisMatch(match, rdb)
-// 		log.Printf("Reset in flight match: %v", match)
-// 		log.Println("Exiting")
-// 		os.Exit(0)
-// 	}()
-// }
-
-func generateMove(model openai.ChatModel, fen string, moves []string, prompt string) (string, error) {
+// GenerateMove generates the next chess move for the given bot parameters
+func GenerateMove(model openai.ChatModel, fen string, moves []string, prompt string) (string, error) {
 	type MoveResponse struct {
 		Move int `json:"Move"`
 	}
@@ -288,6 +283,7 @@ func generateMove(model openai.ChatModel, fen string, moves []string, prompt str
 	}
 }
 
+// GenerateSchema creates the schema for structured outputs
 func GenerateSchema[T any]() interface{} {
 	// Structured Outputs uses a subset of JSON schema
 	// These flags are necessary to comply with the subset
@@ -300,7 +296,8 @@ func GenerateSchema[T any]() interface{} {
 	return schema
 }
 
-func getTurnFromFEN(fen string) (string, error) {
+// GetTurnFromFEN returns the current turn for the given FEN
+func GetTurnFromFEN(fen string) (string, error) {
 	parts := strings.Split(fen, " ")
 	if len(parts) < 2 {
 		return "", fmt.Errorf("invalid FEN string")
@@ -316,7 +313,8 @@ func getTurnFromFEN(fen string) (string, error) {
 	}
 }
 
-func generateValidMoves(fen string) ([]string, error) {
+// GenerateValidMoves returns a list of valid moves for the provided FEN
+func GenerateValidMoves(fen string) ([]string, error) {
 	type ValidMoves struct {
 		Legal_Moves []string `json:"legal_moves"`
 	}
@@ -330,7 +328,7 @@ func generateValidMoves(fen string) ([]string, error) {
 		log.Printf("failed to marshal JSON: %v", err)
 		return emptyReturn, err
 	}
-	res, err := sendStockfishRequest("/legal_moves", jsonBody, "POST")
+	res, err := SendStockfishRequest("/legal_moves", jsonBody, "POST")
 	if err != nil {
 		log.Printf("failed to send stockfish request %v", err)
 	}
@@ -341,7 +339,8 @@ func generateValidMoves(fen string) ([]string, error) {
 	return validMoves.Legal_Moves, nil
 }
 
-func makeMove(fen string, move string) (string, int, error) {
+// MakeMove uses stockfish to execute and score the given move.
+func MakeMove(fen string, move string) (string, int, error) {
 	type response struct {
 		FEN string `json:"fen"`
 	}
@@ -358,7 +357,7 @@ func makeMove(fen string, move string) (string, int, error) {
 		return defaultReturn(err)
 	}
 	var newFenParsed response
-	newFen, err := sendStockfishRequest("/move", jsonBody, "POST")
+	newFen, err := SendStockfishRequest("/move", jsonBody, "POST")
 	if err != nil {
 		log.Printf("failed to send stockfish request %v", err)
 		return defaultReturn(err)
@@ -369,7 +368,7 @@ func makeMove(fen string, move string) (string, int, error) {
 		return defaultReturn(err)
 	}
 	// score move
-	score, err := sendStockfishRequest("/evaluatemove", jsonBody, "POST")
+	score, err := SendStockfishRequest("/evaluatemove", jsonBody, "POST")
 	if err != nil {
 		log.Println("score not set for some reason")
 		return newFenParsed.FEN, -1, nil
@@ -383,11 +382,21 @@ func makeMove(fen string, move string) (string, int, error) {
 	return newFenParsed.FEN, scoreParsed.ScoreDifference, nil
 }
 
-func sendStockfishRequest(stem string, payload []byte, method string) (string, error) {
+// SendStockfishRequest handles sending a request to the stockfish api
+func SendStockfishRequest(stem string, payload []byte, method string) (string, error) {
 	url := os.Getenv("STOCKFISH_URL") + stem
 	if url == "" {
 		url = "http://host.docker.internal:5001" + stem
 	}
+	// Use gcp auth in prod
+	if os.Getenv("IS_PROD") == "true" {
+		data, err := SendAuthenticatedRequest(method, url, payload, map[string]string{"Content-Type": "application/json"})
+		if err != nil {
+			log.Printf("failed to send authenticated request to stockfish: %v", err)
+		}
+		return string(data), err
+	}
+	// Not prod so no auth
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(payload))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -407,7 +416,8 @@ func sendStockfishRequest(stem string, payload []byte, method string) (string, e
 	return string(res), nil
 }
 
-func createRedisMatch(match Match, rdb *redis.Client) error {
+// CreateRedisMatch creates a match in the redis queue
+func CreateRedisMatch(match Match, rdb *redis.Client) error {
 	ctx := context.Background()
 	matchJSON, err := json.Marshal(match)
 	if err != nil {
@@ -420,14 +430,15 @@ func createRedisMatch(match Match, rdb *redis.Client) error {
 	return nil
 }
 
-func writeResult(match Match, db *gorm.DB) error {
+// WriteResult writes the match result to postgres
+func WriteResult(match Match, db *gorm.DB) error {
 	botmatchresultRepository := botmatchresult.NewBotMatchResultRepository(db)
 	historyBytes, err := json.Marshal(match.History)
 	if err != nil {
 		log.Print("error marshaling history")
 		return err
 	}
-	score := determineScore(match.History)
+	score := DetermineScore(match.History)
 	jsonData := botmatchresult.BotMatchResult{
 		BotOneID: int(match.FirstBot.ID),
 		BotTwoID: int(match.SecondBot.ID),
@@ -439,7 +450,8 @@ func writeResult(match Match, db *gorm.DB) error {
 	return nil
 }
 
-func determineScore(history []History) int {
+// DetermineScore returns the score for a match. The overall score denotes who 'won' the game, positive=black, negative=white.
+func DetermineScore(history []History) int {
 	acc := 0
 	for index, history := range history {
 		if index%2 == 0 {
@@ -449,4 +461,61 @@ func determineScore(history []History) int {
 		}
 	}
 	return acc
+}
+
+// SendAuthenticatedRequest sends a request with a GCP ID token (retrieved from the metadata server).
+// It works when running inside GCP (e.g., Cloud Run, GCE, GKE).
+func SendAuthenticatedRequest(
+	method string,
+	url string,
+	body []byte,
+	headers map[string]string, // optional additional headers
+) ([]byte, error) {
+	// Step 1: Get ID token for target URL (audience must match the service)
+	tokenURL := "http://metadata/computeMetadata/v1/instance/service-accounts/default/identity?audience=" + url
+	tokenReq, _ := http.NewRequest("GET", tokenURL, nil)
+	tokenReq.Header.Add("Metadata-Flavor", "Google")
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	tokenResp, err := httpClient.Do(tokenReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch ID token: %w", err)
+	}
+	defer tokenResp.Body.Close()
+
+	idTokenBytes, err := io.ReadAll(tokenResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read ID token: %w", err)
+	}
+	idToken := string(idTokenBytes)
+
+	// Step 2: Make the authenticated request
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+idToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Optional extra headers
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("authenticated request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return respBody, nil
 }

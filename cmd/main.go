@@ -237,7 +237,7 @@ func healthz() bool {
 		log.Printf("failed to connect to db %v", err)
 		return false
 	}
-	if rdb == nil || db == nil || err != nil {
+	if rdb == nil || db == nil {
 		log.Printf("Something went wrong checking downstream dependencies. rdb: %v, db: %v, err: %v", rdb, db, err)
 		return false
 	}
@@ -284,7 +284,7 @@ func GenerateMove(model openai.ChatModel, fen string, moves []string, prompt str
 }
 
 // GenerateSchema creates the schema for structured outputs
-func GenerateSchema[T any]() interface{} {
+func GenerateSchema[T any]() any {
 	// Structured Outputs uses a subset of JSON schema
 	// These flags are necessary to comply with the subset
 	reflector := jsonschema.Reflector{

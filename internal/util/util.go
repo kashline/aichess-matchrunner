@@ -23,6 +23,7 @@ import (
 
 	"aichess-matchrunner/internal/models/bot"
 	"aichess-matchrunner/internal/models/botmatchresult"
+	"aichess-matchrunner/internal/models/rating"
 
 	"github.com/invopop/jsonschema"
 	openai "github.com/openai/openai-go"
@@ -361,7 +362,7 @@ func MakeMove(fen string, move string) (string, int, error) {
 }
 
 // SendStockfishRequest handles sending a request to the stockfish api
-var SendStockfishRequest = func (stem string, payload []byte, method string) (string, error) {
+var SendStockfishRequest = func(stem string, payload []byte, method string) (string, error) {
 	url := os.Getenv("STOCKFISH_URL") + stem
 	if url == "" {
 		url = "http://host.docker.internal:5001" + stem
@@ -408,7 +409,7 @@ func CreateRedisMatch(match Match, rdb *redis.Client) error {
 	return nil
 }
 
-// WriteResult writes the match result to postgres
+// WriteResult writes the match result and rating change to postgres
 func WriteResult(match Match, db *gorm.DB) error {
 	botmatchresultRepository := botmatchresult.NewBotMatchResultRepository(db)
 	historyBytes, err := json.Marshal(match.History)
@@ -424,7 +425,27 @@ func WriteResult(match Match, db *gorm.DB) error {
 		Score:    score,
 		PuzzleID: int(match.PuzzleID),
 	}
-	botmatchresultRepository.CreateResult(jsonData)
+
+	result, err := botmatchresultRepository.CreateResult(jsonData)
+	if err != nil {
+		log.Printf("error writing match result: %v", err)
+		return err
+	}
+	ratingReposity := rating.NewRatingRepository(db)
+	ratingChange, err := ratingReposity.DetermineRating(score, int(match.FirstBot.ID))
+	if err != nil {
+		log.Printf("issue determining rating: %v", err)
+	}
+	ratingData := rating.Rating{
+		MatchID: int(result.ID),
+		Rating:  float64(ratingChange),
+		BotID:   int(match.FirstBot.ID),
+	}
+	_, err = ratingReposity.CreateRating(ratingData)
+	if err != nil {
+		log.Printf("error creating rating: %v", err)
+		return err
+	}
 	return nil
 }
 

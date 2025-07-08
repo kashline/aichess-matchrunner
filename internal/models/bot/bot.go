@@ -1,7 +1,7 @@
 package bot
 
 type Bot struct {
-	ID             uint   `gorm:"primaryKey"`
+	ID             uint `gorm:"primaryKey"`
 	UserID         uint
 	Name           string
 	Model          string

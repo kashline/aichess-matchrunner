@@ -432,7 +432,11 @@ func WriteResult(match Match, db *gorm.DB) error {
 		return err
 	}
 	ratingReposity := rating.NewRatingRepository(db)
-	ratingChange, err := ratingReposity.DetermineRating(score, int(match.FirstBot.ID))
+	ratingChange, err := ratingReposity.DetermineRating(score, int(match.FirstBot.ID), true)
+	if err != nil {
+		log.Printf("issue determining rating: %v", err)
+	}
+	ratingChangeSecond, err := ratingReposity.DetermineRating(score, int(match.SecondBot.ID), false)
 	if err != nil {
 		log.Printf("issue determining rating: %v", err)
 	}
@@ -441,7 +445,17 @@ func WriteResult(match Match, db *gorm.DB) error {
 		Rating:  float64(ratingChange),
 		BotID:   int(match.FirstBot.ID),
 	}
+	ratingDataSecond := rating.Rating{
+		MatchID: int(result.ID),
+		Rating:  float64(ratingChangeSecond),
+		BotID:   int(match.SecondBot.ID),
+	}
 	_, err = ratingReposity.CreateRating(ratingData)
+	if err != nil {
+		log.Printf("error creating rating: %v", err)
+		return err
+	}
+	_, err = ratingReposity.CreateRating(ratingDataSecond)
 	if err != nil {
 		log.Printf("error creating rating: %v", err)
 		return err

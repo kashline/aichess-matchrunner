@@ -2,6 +2,7 @@ package rating
 
 import (
 	"errors"
+	"log"
 	"math"
 
 	"gorm.io/gorm"
@@ -27,13 +28,15 @@ func (r *RatingRepository) CreateRating(data Rating) (*Rating, error) {
 	return &Rating, nil
 }
 
-func (r *RatingRepository) DetermineRating(matchScore int, botID int) (int, error) {
+func (r *RatingRepository) DetermineRating(matchScore int, botID int, firstPlayer bool) (int, error) {
 	// Get last rating
 	var latestRating Rating
 	err := r.db.Where(`"BotID" = ?`, botID).Order(`"createdAt" DESC`).First(&latestRating).Error
 	if err != nil {
 		if err.Error() == "record not found" {
-			latestRating.Rating = 1500
+			var newRating = float64(1500)
+			log.Printf("No current rating for bot %v, creating new rating at %v", botID, newRating)
+			latestRating.Rating = newRating
 		} else {
 			return 0, err
 		}
@@ -54,9 +57,9 @@ func (r *RatingRepository) DetermineRating(matchScore int, botID int) (int, erro
 	}
 
 	// Return the new rating
-	if matchScore < 0 {
-		return int(latestRating.Rating) + score*-1, nil
-	} else {
+	if (matchScore < 0 && firstPlayer) || (matchScore > 0 && !firstPlayer) {
 		return int(latestRating.Rating) + score, nil
+	} else {
+		return int(latestRating.Rating) + score*-1, nil
 	}
 }

@@ -10,9 +10,10 @@ import (
 	"aichess-matchrunner/internal/util"
 
 	"context"
+	"sync"
+
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"sync"
 )
 
 func main() {
